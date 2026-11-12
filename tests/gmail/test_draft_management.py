@@ -12,10 +12,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.
 from core.server import server
 from core.tool_registry import get_tool_components
 from core.utils import UserInputError
+from gmail.gmail_helpers import (
+    _decode_base64url,
+    draft_is_reply,
+    rewrite_draft_mime,
+)
 from gmail.gmail_tools import (
-    _decode_gmail_raw,
-    _draft_is_reply,
-    _rewrite_draft_mime,
     delete_gmail_draft,
     list_gmail_drafts,
     manage_gmail_trash,
@@ -61,13 +63,13 @@ def _parse(data: bytes):
     return message_from_bytes(data, policy=policy.default)
 
 
-def test_decode_gmail_raw_tolerates_missing_padding():
+def test_draft_raw_decode_tolerates_missing_padding():
     data = b"Subject: x\r\n\r\nhello!"
-    assert _decode_gmail_raw(_raw(data)) == data
+    assert _decode_base64url(_raw(data)) == data
 
 
 def test_rewrite_changes_only_the_requested_fields():
-    new_bytes, changed = _rewrite_draft_mime(_build(reply=True), subject="New subject")
+    new_bytes, changed = rewrite_draft_mime(_build(reply=True), subject="New subject")
     msg = _parse(new_bytes)
     assert changed == ["subject"]
     assert msg["Subject"] == "New subject"
@@ -80,7 +82,7 @@ def test_rewrite_changes_only_the_requested_fields():
 
 
 def test_rewrite_replaces_plain_body_and_drops_stale_html_alternative():
-    new_bytes, changed = _rewrite_draft_mime(_build(html=True), body="Fresh text")
+    new_bytes, changed = rewrite_draft_mime(_build(html=True), body="Fresh text")
     msg = _parse(new_bytes)
     assert changed == ["body"]
     assert msg.get_content_type() == "text/plain"
@@ -89,7 +91,7 @@ def test_rewrite_replaces_plain_body_and_drops_stale_html_alternative():
 
 
 def test_rewrite_html_body_builds_plain_and_html_alternatives():
-    new_bytes, _ = _rewrite_draft_mime(
+    new_bytes, _ = rewrite_draft_mime(
         _build(), body="<p>Hello <b>there</b></p>", body_format="html"
     )
     msg = _parse(new_bytes)
@@ -99,7 +101,7 @@ def test_rewrite_html_body_builds_plain_and_html_alternatives():
 
 
 def test_rewrite_keeps_attachments_when_body_changes():
-    new_bytes, _ = _rewrite_draft_mime(_build(attachment=True), body="With file")
+    new_bytes, _ = rewrite_draft_mime(_build(attachment=True), body="With file")
     msg = _parse(new_bytes)
     attachments = list(msg.iter_attachments())
     assert msg.get_content_type() == "multipart/mixed"
@@ -109,7 +111,7 @@ def test_rewrite_keeps_attachments_when_body_changes():
 
 
 def test_rewrite_empty_string_clears_recipient_header():
-    new_bytes, changed = _rewrite_draft_mime(_build(), cc="", to="a@x.com, b@x.com")
+    new_bytes, changed = rewrite_draft_mime(_build(), cc="", to="a@x.com, b@x.com")
     msg = _parse(new_bytes)
     assert set(changed) == {"to", "cc"}
     assert msg["Cc"] is None
@@ -118,7 +120,7 @@ def test_rewrite_empty_string_clears_recipient_header():
 
 def test_rewrite_handles_non_ascii_and_long_lines():
     body = "Café – " + ("long " * 60)
-    new_bytes, _ = _rewrite_draft_mime(_build(), subject="Résumé", body=body)
+    new_bytes, _ = rewrite_draft_mime(_build(), subject="Résumé", body=body)
     msg = _parse(new_bytes)
     assert msg["Subject"] == "Résumé"
     assert msg.get_content().strip() == body.strip()
@@ -128,17 +130,17 @@ def test_rewrite_handles_non_ascii_and_long_lines():
 @pytest.mark.parametrize("field", ["subject", "to", "cc", "bcc"])
 def test_rewrite_rejects_header_injection(field):
     with pytest.raises(UserInputError):
-        _rewrite_draft_mime(_build(), **{field: "x\r\nBcc: evil@example.com"})
+        rewrite_draft_mime(_build(), **{field: "x\r\nBcc: evil@example.com"})
 
 
 def test_rewrite_rejects_unknown_body_format():
     with pytest.raises(UserInputError):
-        _rewrite_draft_mime(_build(), body="x", body_format="markdown")
+        rewrite_draft_mime(_build(), body="x", body_format="markdown")
 
 
-def test_draft_is_reply_detects_reply_headers():
-    assert _draft_is_reply(_build(reply=True)) is True
-    assert _draft_is_reply(_build()) is False
+def testdraft_is_reply_detects_reply_headers():
+    assert draft_is_reply(_build(reply=True)) is True
+    assert draft_is_reply(_build()) is False
 
 
 @pytest.mark.asyncio
@@ -164,7 +166,7 @@ async def test_update_gmail_draft_keeps_thread_for_reply_drafts():
     )
     assert update_kwargs["id"] == "r-1"
     assert update_kwargs["body"]["message"]["threadId"] == "t-9"
-    sent = _parse(_decode_gmail_raw(update_kwargs["body"]["message"]["raw"]))
+    sent = _parse(_decode_base64url(update_kwargs["body"]["message"]["raw"]))
     assert sent.get_content().strip() == "Revised"
     assert sent["Subject"] == "Original subject"
     assert "m-new" in result and "Changed: body" in result
@@ -217,7 +219,7 @@ async def test_send_gmail_draft_sends_by_id_without_retries():
     send_kwargs = service.users.return_value.drafts.return_value.send.call_args.kwargs
     assert send_kwargs == {"userId": "me", "body": {"id": "r-7"}}
     execute = service.users.return_value.drafts.return_value.send.return_value.execute
-    assert execute.call_args.kwargs == {}
+    assert execute.call_args.kwargs == {"num_retries": 0}
     assert "m-sent" in result and "t-1" in result
 
 

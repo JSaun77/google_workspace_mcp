@@ -18,15 +18,12 @@ from pathlib import Path
 from typing import Annotated, Optional, List, Dict, Literal, Any, Union
 from urllib.parse import unquote, urlparse, urlunsplit
 
-from email import message_from_bytes
-from email import policy as email_policy
 from email.message import EmailMessage
 from email.policy import SMTP
 from email.utils import formataddr
 
 import httpx
 from fastmcp.exceptions import ToolError as ToolExecutionError
-from googleapiclient.errors import HttpError
 from mcp.types import ToolAnnotations
 
 from pydantic import Field
@@ -100,10 +97,15 @@ from gmail.gmail_helpers import (
     format_thread_label_outcomes,
     html_newlines_to_br,
     html_to_text_preserving_breaks,
+    list_gmail_draft_summaries,
     modify_gmail_thread_labels,
     read_gmail_message_page,
+    remove_gmail_draft,
+    send_gmail_draft_once,
     send_message_once,
+    set_gmail_trash_state,
     update_gmail_filter,
+    update_gmail_draft_in_place,
 )
 from gmail.gmail_web_mime import TextDirection
 
@@ -4860,94 +4862,6 @@ async def batch_modify_gmail_message_labels(
     return "\n".join(lines)
 
 
-# =============================================================================
-# Draft management and trash tools
-#
-# Fork addition (JSaun77/google_workspace_mcp): list, update, send and delete
-# existing drafts, and move messages or threads to and from Trash. Upstream
-# only creates drafts; these tools let a client revise a reviewed draft in
-# place and send exactly what was reviewed.
-# =============================================================================
-
-GMAIL_DRAFT_LIST_MAX_PAGE_SIZE = 50
-GMAIL_TRASH_MAX_IDS = 100
-_DRAFT_HEADER_FIELDS = (
-    ("Subject", "subject"),
-    ("To", "to"),
-    ("Cc", "cc"),
-    ("Bcc", "bcc"),
-)
-
-
-def _decode_gmail_raw(raw: str) -> bytes:
-    """Decode Gmail's URL-safe base64 ``raw`` field, tolerating missing padding."""
-    return base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
-
-
-def _rewrite_draft_mime(
-    raw_bytes: bytes,
-    *,
-    subject: Optional[str] = None,
-    body: Optional[str] = None,
-    body_format: str = "plain",
-    to: Optional[str] = None,
-    cc: Optional[str] = None,
-    bcc: Optional[str] = None,
-) -> tuple[bytes, List[str]]:
-    """
-    Apply field-level edits to an existing draft's MIME message.
-
-    ``None`` keeps a field as it is. An empty string removes the Subject, To,
-    Cc or Bcc header. Replacing the body keeps attachments, and every other
-    header (From, In-Reply-To, References, Date) is preserved, so a reply
-    draft stays threaded.
-
-    Returns the new MIME bytes and the list of fields that changed.
-    """
-    values = {"subject": subject, "to": to, "cc": cc, "bcc": bcc}
-    for name, value in values.items():
-        if value is not None and ("\r" in value or "\n" in value):
-            raise UserInputError(f"'{name}' must not contain line breaks.")
-    if body_format not in ("plain", "html"):
-        raise UserInputError("body_format must be 'plain' or 'html'.")
-
-    msg = message_from_bytes(raw_bytes, policy=email_policy.default)
-    changed: List[str] = []
-
-    for header, name in _DRAFT_HEADER_FIELDS:
-        value = values[name]
-        if value is None:
-            continue
-        del msg[header]
-        if value.strip():
-            msg[header] = value.strip()
-        changed.append(name)
-
-    if body is not None:
-        attachments = list(msg.iter_attachments()) if msg.is_multipart() else []
-        msg.clear_content()
-        if body_format == "html":
-            msg.set_content(
-                _html_to_text(body) or " ", subtype="plain", charset="utf-8"
-            )
-            msg.add_alternative(body, subtype="html", charset="utf-8")
-        else:
-            msg.set_content(body, subtype="plain", charset="utf-8")
-        if attachments:
-            msg.make_mixed()
-            for part in attachments:
-                msg.attach(part)
-        changed.append("body")
-
-    return msg.as_bytes(policy=SMTP), changed
-
-
-def _draft_is_reply(raw_bytes: bytes) -> bool:
-    """True when the draft carries reply headers and must stay on its thread."""
-    msg = message_from_bytes(raw_bytes, policy=email_policy.default)
-    return bool(msg.get("In-Reply-To") or msg.get("References"))
-
-
 @server.tool(
     title="List Gmail Drafts",
     annotations=ToolAnnotations(
@@ -4997,62 +4911,7 @@ async def list_gmail_drafts(
     logger.info(
         f"[list_gmail_drafts] Invoked. Email: '{user_google_email}', Query: '{query}'"
     )
-
-    page_size = max(1, min(int(page_size), GMAIL_DRAFT_LIST_MAX_PAGE_SIZE))
-    params: Dict[str, Any] = {"userId": "me", "maxResults": page_size}
-    if query:
-        params["q"] = query
-    if page_token:
-        params["pageToken"] = page_token
-
-    response = await asyncio.to_thread(service.users().drafts().list(**params).execute)
-    drafts = response.get("drafts", [])
-    if not drafts:
-        suffix = f" matching '{query}'" if query else ""
-        return f"No drafts found{suffix}."
-
-    lines = [f"Found {len(drafts)} drafts:", ""]
-    for index, draft in enumerate(drafts, 1):
-        draft_id = draft.get("id")
-        message = draft.get("message", {}) or {}
-        headers: Dict[str, str] = {}
-        try:
-            detail = await asyncio.to_thread(
-                service.users()
-                .drafts()
-                .get(userId="me", id=draft_id, format="metadata")
-                .execute
-            )
-            message = detail.get("message", message) or message
-            headers = _extract_headers(
-                message.get("payload", {}) or {}, ["To", "Cc", "Subject", "Date"]
-            )
-        except HttpError as error:
-            logger.warning(
-                f"[list_gmail_drafts] Could not read draft {draft_id}: {error}"
-            )
-
-        lines.append(f"{index}. Draft ID: {draft_id}")
-        lines.append(f"   Message ID: {message.get('id', '(unknown)')}")
-        lines.append(f"   Thread ID: {message.get('threadId', '(unknown)')}")
-        lines.append(f"   To: {headers.get('To') or '(none)'}")
-        if headers.get("Cc"):
-            lines.append(f"   Cc: {headers['Cc']}")
-        lines.append(f"   Subject: {headers.get('Subject') or '(no subject)'}")
-        if headers.get("Date"):
-            lines.append(f"   Date: {headers['Date']}")
-        snippet = (message.get("snippet") or "").strip()
-        if snippet:
-            lines.append(f"   Snippet: {snippet[:160]}")
-        lines.append("")
-
-    next_token = response.get("nextPageToken")
-    if next_token:
-        lines.append(
-            f"More drafts available. Call list_gmail_drafts again with page_token='{next_token}'"
-        )
-
-    return "\n".join(lines).rstrip()
+    return await list_gmail_draft_summaries(service, query, page_size, page_token)
 
 
 @server.tool(
@@ -5131,52 +4990,15 @@ async def update_gmail_draft(
     logger.info(
         f"[update_gmail_draft] Invoked. Email: '{user_google_email}', Draft ID: '{draft_id}'"
     )
-
-    if all(value is None for value in (subject, body, to, cc, bcc)):
-        raise UserInputError(
-            "Nothing to update. Provide at least one of subject, body, to, cc or bcc."
-        )
-
-    existing = await asyncio.to_thread(
-        service.users().drafts().get(userId="me", id=draft_id, format="raw").execute
-    )
-    message = existing.get("message", {}) or {}
-    raw = message.get("raw")
-    if not raw:
-        raise Exception(
-            f"Draft {draft_id} returned no content, so it cannot be updated."
-        )
-
-    raw_bytes = _decode_gmail_raw(raw)
-    new_bytes, changed = _rewrite_draft_mime(
-        raw_bytes,
+    return await update_gmail_draft_in_place(
+        service,
+        draft_id,
         subject=subject,
         body=body,
         body_format=body_format,
         to=to,
         cc=cc,
         bcc=bcc,
-    )
-
-    draft_body: Dict[str, Any] = {
-        "message": {"raw": base64.urlsafe_b64encode(new_bytes).decode()}
-    }
-    thread_id = message.get("threadId")
-    if thread_id and _draft_is_reply(raw_bytes):
-        draft_body["message"]["threadId"] = thread_id
-
-    updated = await asyncio.to_thread(
-        service.users()
-        .drafts()
-        .update(userId="me", id=draft_id, body=draft_body)
-        .execute,
-        num_retries=GOOGLE_API_WRITE_RETRIES,
-    )
-    new_message_id = (updated.get("message", {}) or {}).get("id", "(unknown)")
-    return (
-        f"Draft updated! Draft ID: {updated.get('id', draft_id)}\n"
-        f"Message ID: {new_message_id}\n"
-        f"Changed: {', '.join(changed)}"
     )
 
 
@@ -5218,14 +5040,7 @@ async def send_gmail_draft(
     logger.info(
         f"[send_gmail_draft] Invoked. Email: '{user_google_email}', Draft ID: '{draft_id}'"
     )
-
-    # No retries here: a retried send after an ambiguous failure can deliver twice.
-    sent = await asyncio.to_thread(
-        service.users().drafts().send(userId="me", body={"id": draft_id}).execute
-    )
-    return (
-        f"Draft sent! Message ID: {sent.get('id')}\nThread ID: {sent.get('threadId')}"
-    )
+    return await send_gmail_draft_once(service, draft_id)
 
 
 @server.tool(
@@ -5274,27 +5089,7 @@ async def delete_gmail_draft(
     logger.info(
         f"[delete_gmail_draft] Invoked. Email: '{user_google_email}', Draft ID: '{draft_id}', Permanent: {permanent}"
     )
-
-    if permanent:
-        await asyncio.to_thread(
-            service.users().drafts().delete(userId="me", id=draft_id).execute
-        )
-        return f"Draft permanently deleted. Draft ID: {draft_id}"
-
-    draft = await asyncio.to_thread(
-        service.users().drafts().get(userId="me", id=draft_id, format="minimal").execute
-    )
-    message_id = (draft.get("message", {}) or {}).get("id")
-    if not message_id:
-        raise Exception(f"Draft {draft_id} has no message to move to Trash.")
-
-    await asyncio.to_thread(
-        service.users().messages().trash(userId="me", id=message_id).execute
-    )
-    return (
-        f"Draft moved to Trash (recoverable for about 30 days). Draft ID: {draft_id}\n"
-        f"Message ID: {message_id}"
-    )
+    return await remove_gmail_draft(service, draft_id, permanent)
 
 
 @server.tool(
@@ -5351,41 +5146,4 @@ async def manage_gmail_trash(
         f"[manage_gmail_trash] Invoked. Email: '{user_google_email}', Action: '{action}', "
         f"Messages: {len(message_ids or [])}, Threads: {len(thread_ids or [])}"
     )
-
-    if action not in ("trash", "untrash"):
-        raise UserInputError("action must be 'trash' or 'untrash'.")
-    message_ids = list(message_ids or [])
-    thread_ids = list(thread_ids or [])
-    total = len(message_ids) + len(thread_ids)
-    if total == 0:
-        raise UserInputError("Provide at least one of message_ids or thread_ids.")
-    if total > GMAIL_TRASH_MAX_IDS:
-        raise UserInputError(
-            f"Too many IDs ({total}). The limit is {GMAIL_TRASH_MAX_IDS} per call."
-        )
-
-    users = service.users()
-    done: List[str] = []
-    failed: List[str] = []
-    for kind, ids in (("message", message_ids), ("thread", thread_ids)):
-        for item_id in ids:
-            resource = users.messages() if kind == "message" else users.threads()
-            request = (
-                resource.trash(userId="me", id=item_id)
-                if action == "trash"
-                else resource.untrash(userId="me", id=item_id)
-            )
-            try:
-                await asyncio.to_thread(request.execute)
-                done.append(f"{kind} {item_id}")
-            except HttpError as error:
-                status = getattr(getattr(error, "resp", None), "status", "?")
-                failed.append(f"{kind} {item_id} (HTTP {status})")
-
-    verb = "Moved to Trash" if action == "trash" else "Restored from Trash"
-    if not done:
-        raise Exception(f"No items were processed. Failed: {'; '.join(failed)}")
-    summary = f"{verb}: {len(done)} of {total} ({', '.join(done)})"
-    if failed:
-        summary += f"\nFailed: {'; '.join(failed)}"
-    return summary
+    return await set_gmail_trash_state(service, action, message_ids, thread_ids)

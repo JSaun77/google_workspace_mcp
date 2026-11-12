@@ -1,10 +1,11 @@
 # Google Gmail Tools Reference
 
-MCP tools for Gmail message search, sending, drafting, labels, and filters. All tools require `user_google_email` (string, required).
+MCP tools for Gmail message search, sending, drafting, trash, labels, and filters. All tools require `user_google_email` (string, required).
 
 ## Contents
 - Search & Read: search_gmail_messages, get_gmail_message_content, get_gmail_messages_content_batch, get_gmail_thread_content, get_gmail_threads_content_batch, get_gmail_attachment_content
 - Send & Draft: send_gmail_message, draft_gmail_message
+- Draft Management & Trash: list_gmail_drafts, update_gmail_draft, send_gmail_draft, delete_gmail_draft, manage_gmail_trash
 - Label Management: list_gmail_labels, manage_gmail_label, modify_gmail_message_labels, batch_modify_gmail_message_labels
 - Filter Management: list_gmail_filters, manage_gmail_filter
 - Tips
@@ -154,6 +155,67 @@ Operational Gmail settings errors such as rate limits abort draft creation inste
 
 ---
 
+## Draft Management & Trash
+
+These tools take a Draft ID, which is not the Message ID that search returns. `draft_gmail_message` and `list_gmail_drafts` report both.
+
+### list_gmail_drafts
+List drafts with their Draft ID, Message ID, Thread ID, To, Subject, Date and a snippet.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes | | |
+| query | string | no | | Gmail search query to filter drafts, e.g. `subject:invoice` |
+| page_size | integer | no | 25 | Drafts per page, 1 to 50; costs one metadata read per draft |
+| page_token | string | no | | Pagination token from a previous response |
+
+### update_gmail_draft
+Edit an existing draft in place. Nothing is sent. Only the fields passed change; attachments and reply threading are kept.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes | | |
+| draft_id | string | yes | | |
+| subject | string | no | | Omit to keep the current subject |
+| body | string | no | | Replaces the whole current body; omit to keep it |
+| body_format | string | no | "plain" | "plain" or "html"; only used when body is given |
+| to | string | no | | Comma separated. Omit to keep, pass an empty string to clear |
+| cc | string | no | | Omit to keep, pass an empty string to clear |
+| bcc | string | no | | Omit to keep, pass an empty string to clear |
+
+At least one of subject, body, to, cc or bcc is required. The Draft ID stays the same; Gmail assigns the draft a new Message ID. The body is replaced as given: a signature or quoted original already in the draft is not re-added.
+
+### send_gmail_draft
+Send a saved draft exactly as it is, to the recipients already on it. Sending cannot be undone and is never retried, so an ambiguous failure cannot deliver twice.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes | | |
+| draft_id | string | yes | | |
+
+### delete_gmail_draft
+Remove a draft. Moves it to Trash by default.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes | | |
+| draft_id | string | yes | | |
+| permanent | boolean | no | false | false moves the draft to Trash (recoverable for about 30 days) and returns its Message ID; true deletes it immediately and cannot be undone |
+
+### manage_gmail_trash
+Move messages or whole threads to Trash, or restore them. Never deletes permanently.
+
+| Parameter | Type | Required | Default | Notes |
+|-----------|------|----------|---------|-------|
+| user_google_email | string | yes | | |
+| action | string | yes | | "trash" or "untrash" |
+| message_ids | array of strings | one of | | Message IDs |
+| thread_ids | array of strings | one of | | Thread IDs; affects every message in each thread |
+
+Up to 100 IDs per call across both lists. Items are processed one at a time, and any that fail are listed with their HTTP status while the rest still go through.
+
+---
+
 ## Label Management
 
 ### list_gmail_labels
@@ -270,6 +332,7 @@ Create, delete, update, or apply a filter. Update recreates the filter (Gmail ha
 ### Drafts vs Send
 - Use `draft_gmail_message` when you want the user to review before sending. It supports `include_signature` (auto-appends Gmail signature) and `quote_original` (includes quoted reply text).
 - Use `send_gmail_message` for immediate delivery.
+- To change or send a draft that already exists, use `list_gmail_drafts` to get its Draft ID, then `update_gmail_draft` and `send_gmail_draft`. Calling `draft_gmail_message` again creates a second draft.
 - To forward, pass `forward_message_id` to either tool; the original subject, quoted body and (by default) attachments are carried over, and `body` becomes an optional note.
 
 ### Attachments
